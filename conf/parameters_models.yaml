@@ -1,0 +1,31 @@
+models:
+  transformer:
+    learning_rate: 0.0005
+    #feature_dim: 256 # use 256 for medsam 768 for dino
+    batch_size: 1
+    virtual_batch_size: 16
+    num_epochs: 50
+    patience: 15
+    chest:
+      num_layers: 2
+      num_heads: 4
+      mlp_ratio: 4
+    ct:
+      num_layers: 2
+      num_heads: 4
+      mlp_ratio: 4
+    pet:
+      num_layers: 2
+      num_heads: 4
+      mlp_ratio: 4
+  conv:
+    learning_rate: 0.0005
+    feature_dim: 256
+    batch_size: 1
+    virtual_batch_size: 16
+    num_epochs: 500
+    patience: 15
+    ct:
+      div: 2
+    pet:
+      div: 2

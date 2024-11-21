@@ -1,0 +1,14 @@
+# ignore everything in the following folders
+data/*
+models/*
+metrics/*
+plots/*
+src/MedSAM/work_dir/*
+.spyproject/*
+*__pycache__*
+# ignore extensions
+*.txt
+*.html
+*.csv
+*.pth
+*bak*
