@@ -29,7 +29,7 @@ def load_json(json_path: str):
 
 
 if __name__ == "__main__":
-    folder = 'petct_online_rad_dino'
+    folder = 'petct_online_medsam_lora_focalloss_thr0'
 
     metrics_per_fold = []
     metrics_sumary = {}
