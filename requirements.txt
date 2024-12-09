@@ -1,0 +1,6 @@
+pandas
+h5py
+plotly
+threadpoolctl
+tensorflow_datasets
+transformers
