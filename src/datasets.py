@@ -345,6 +345,7 @@ class PETCTDataset3D_onlineV2(Dataset):
             
 
         print("Dataset Size: ",len(self.df_metadata))
+        #print(self.df_metadata)
 
     def _process_dataframe(self,df_metdata):
         dataframe=self.df_ct.copy()
@@ -460,9 +461,12 @@ class PETCTDataset3D_onlineV2(Dataset):
                 else:
                     start_slice_index=b_mask
                     end_slice_index = f_mask
+                    
+            patient_id_rew=f"{patient_id}:{start_slice_index}"
         else:
             start_slice_index = patient["begin"]
             end_slice_index = start_slice_index+patient["divisor"]
+            patient_id_rew=patient["patient_id_new"]
 
         
         all_images[0]=all_images[0][:,:,start_slice_index:end_slice_index]
@@ -474,4 +478,4 @@ class PETCTDataset3D_onlineV2(Dataset):
         labels = np.expand_dims(labels, axis=-1)
         labels = self.label_encoder.transform(labels.reshape(-1, 1)).toarray()
         labels = torch.as_tensor(labels, dtype=torch.float32)
-        return all_images, all_masks, all_big_masks,labels ,patient_id, all_spatial_res
+        return all_images, all_masks, all_big_masks,labels ,patient_id, all_spatial_res, patient_id_rew

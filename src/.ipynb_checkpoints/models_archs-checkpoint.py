@@ -16,6 +16,7 @@ def save_checkpoint(model, save_dir, epoch):
         os.makedirs(save_dir)
     epoch_str = str(epoch).zfill(4)
     model_path = os.path.join(save_dir, f'model_epoch_{epoch_str}.pth')
+    model_path = os.path.join(save_dir, f'best_model_epoch.pth')
     save(model, model_path)
 
 
@@ -40,7 +41,7 @@ class TransformerNoduleBimodalClassifier(nn.Module):
                  mlp_ratio_ct, mlp_ratio_pet,
                  num_heads_ct, num_heads_pet,
                  num_layers_ct, num_layers_pet,
-                 num_classes):
+                 froze_trans,num_classes):
         super(TransformerNoduleBimodalClassifier, self).__init__()
 
         self.transformer_encoder_ct = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=input_dim,
@@ -73,6 +74,8 @@ class TransformerNoduleBimodalClassifier(nn.Module):
         self.cross_attention_pet = CrossAttentionLayer(input_dim, num_heads_ct)
         self.classifier_petct = MLPLayer(input_dim, input_dim*2, num_classes, dropout_rate=0.1)
 
+        self.froze_trans=froze_trans
+
     def forward(self, x_ct=None, x_pet=None):
         use_ct = x_ct is not None
         use_pet = x_pet is not None
@@ -80,18 +83,30 @@ class TransformerNoduleBimodalClassifier(nn.Module):
         # add cls token and norm to each pet ct seq
         if use_ct:
             batch, seq_len, feature_dim = x_ct.shape
-            x_ct = torch.cat([self.cls_token_ct.repeat(batch, 1, 1), x_ct], dim=1)
-            x_ct = self.norm_ct(x_ct)
-            x_ct = self.transformer_encoder_ct(x_ct)
+            if self.froze_trans:
+                with torch.no_grad():
+                    x_ct = torch.cat([self.cls_token_ct.repeat(batch, 1, 1), x_ct], dim=1)
+                    x_ct = self.norm_ct(x_ct)
+                    x_ct = self.transformer_encoder_ct(x_ct)
+            else:
+                x_ct = torch.cat([self.cls_token_ct.repeat(batch, 1, 1), x_ct], dim=1)
+                x_ct = self.norm_ct(x_ct)
+                x_ct = self.transformer_encoder_ct(x_ct)
             ct_cls_token = x_ct[:, 0, :]
         else:
             ct_cls_token = self.cls_token_ct.repeat(1, 1, 1)
 
         if use_pet:
             batch, seq_len, feature_dim = x_pet.shape
-            x_pet = torch.cat([self.cls_token_pet.repeat(batch, 1, 1), x_pet], dim=1)
-            x_pet = self.norm_pet(x_pet)
-            x_pet = self.transformer_encoder_pet(x_pet)
+            if self.froze_trans:
+                with torch.no_grad():
+                    x_pet = torch.cat([self.cls_token_pet.repeat(batch, 1, 1), x_pet], dim=1)
+                    x_pet = self.norm_pet(x_pet)
+                    x_pet = self.transformer_encoder_pet(x_pet)
+            else:
+                x_pet = torch.cat([self.cls_token_pet.repeat(batch, 1, 1), x_pet], dim=1)
+                x_pet = self.norm_pet(x_pet)
+                x_pet = self.transformer_encoder_pet(x_pet)
             pet_cls_token = x_pet[:, 0, :]
         else:
             pet_cls_token = self.cls_token_pet.repeat(1, 1, 1)
@@ -123,7 +138,7 @@ class TransformerNoduleBimodalClassifier(nn.Module):
 
         return logits_petct, petct_cls_token, logits_ct, logits_pet
 
-
+#Modified
 class TransformerNoduleClassifier(nn.Module):
     def __init__(self, input_dim, dim_feedforward, num_heads, num_classes, num_layers,):
         super(TransformerNoduleClassifier, self).__init__()
@@ -136,15 +151,25 @@ class TransformerNoduleClassifier(nn.Module):
         self.norm = nn.LayerNorm(input_dim)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.randn(1, 1, input_dim))
-        self.classifier = MLPLayer(input_dim, input_dim*2, num_classes)
-
+        self.cross_attention = CrossAttentionLayer(input_dim, num_heads) #added
+        self.classifier_prev = MLPLayer(input_dim, input_dim*2, num_classes, dropout_rate=0.1)
+        self.classifier_final = MLPLayer(input_dim, input_dim*2, num_classes, dropout_rate=0.1)
+        
     def forward(self, x):
         batch, seq_len, feature_dim = x.shape
         cls_token = self.cls_token.repeat(batch, 1, 1)
         x = torch.cat([cls_token, x], dim=1)
         x = self.norm(x)
         x = self.transformer_encoder(x)
-        return self.classifier(x[:,0,:]), x[:,0,:]
+        ###added
+        cls_token = x[:, 0, :]    
+        logits_prev = self.classifier_prev(cls_token)
+
+        x_attn = self.cross_attention(query=x, key=x, value=x)
+                
+        logits_final = self.classifier_final(x_attn[:, 0, :])
+        ###added
+        return logits_final, logits_prev
 
 
 class NoduleClassifier(nn.Module):

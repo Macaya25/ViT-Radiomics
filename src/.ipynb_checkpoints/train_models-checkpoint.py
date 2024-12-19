@@ -235,7 +235,7 @@ class CrossModalFocalLoss(nn.Module):
         self.beta = beta
         self.eps = 1e-8
 
-    def forward(self, inputs_petct, inputs_ct, inputs_pet, targets):
+    def forward(self, inputs_petct, targets, inputs_ct, inputs_pet=None):
         """
         inputs_petct: [N, C], float32
         inputs_ct: [N, C], float32
@@ -245,30 +245,36 @@ class CrossModalFocalLoss(nn.Module):
         if len(inputs_petct.shape) == 1:
             inputs_petct = torch.unsqueeze(inputs_petct, 0)
             inputs_ct = torch.unsqueeze(inputs_ct, 0)
-            inputs_pet = torch.unsqueeze(inputs_pet, 0)
+            if inputs_pet!=None:      
+                inputs_pet = torch.unsqueeze(inputs_pet, 0)
             targets = torch.unsqueeze(targets, 0)
         class_indices = torch.argmax(targets, dim=1)
 
         logpt_petct = F.log_softmax(inputs_petct, dim=1)
         logpt_ct = F.log_softmax(inputs_ct, dim=1)
-        logpt_pet = F.log_softmax(inputs_pet, dim=1)
 
         pt_petct = torch.exp(logpt_petct)
         logpt_petct = (1-pt_petct)**self.gamma_bimodal * logpt_petct
         loss_petct = F.nll_loss(logpt_petct, class_indices, self.alpha, reduction='mean')
 
         pt_ct = torch.exp(logpt_ct)
-        pt_pet = torch.exp(logpt_pet)
-
-        pt_mean = (2*pt_ct*pt_pet) / (pt_ct + pt_pet + self.eps)
-
+        
+        if inputs_pet!=None:       
+            logpt_pet = F.log_softmax(inputs_pet, dim=1)
+            pt_pet = torch.exp(logpt_pet)
+            pt_mean = (2*pt_ct*pt_pet) / (pt_ct + pt_pet + self.eps)
+            logpt_pet = (1-pt_mean*pt_pet)**self.gamma_unimodal * logpt_pet
+            loss_pet = F.nll_loss(logpt_pet, class_indices, self.alpha, reduction='mean')
+        else:
+            pt_mean = (2*pt_ct*pt_ct) / (pt_ct + pt_ct + self.eps)
+        
         logpt_ct = (1-pt_mean*pt_ct)**self.gamma_unimodal * logpt_ct
         loss_ct = F.nll_loss(logpt_ct, class_indices, self.alpha, reduction='mean')
 
-        logpt_pet = (1-pt_mean*pt_pet)**self.gamma_unimodal * logpt_pet
-        loss_pet = F.nll_loss(logpt_pet, class_indices, self.alpha, reduction='mean')
-
-        loss = (self.beta*loss_petct + (1-self.beta)*(loss_ct + loss_pet))
+        if inputs_pet==None:
+            loss = (self.beta*loss_petct + (1-self.beta)*(loss_ct))
+        else:
+            loss = (self.beta*loss_petct + (1-self.beta)*(loss_ct + loss_pet))
         return loss
 
 
@@ -313,9 +319,10 @@ def get_number_of_params(model):
     param_count = sum([np.prod(p.size()) for p in model_parameters])
     return param_count
 
-def build_model(cfg, feature_dim,arch, modality, modality_a, modality_b, num_classes=2):
+def build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,mono_train ,num_classes=2):
     cfg_model = cfg['models'][arch]
     if modality == 'petct' or modality == 'petchest':
+        print("\nUsing Bimodal Classifier\n")
         mlp_ratio_ct = cfg_model[modality_b]['mlp_ratio']
         mlp_ratio_pet = cfg_model[modality_a]['mlp_ratio']
 
@@ -329,11 +336,13 @@ def build_model(cfg, feature_dim,arch, modality, modality_a, modality_b, num_cla
                                                    mlp_ratio_ct, mlp_ratio_pet,
                                                    num_heads_ct, num_heads_pet,
                                                    num_layers_ct, num_layers_pet,
-                                                   num_classes=num_classes)
+                                                   mono_train,num_classes=num_classes)
     elif arch == 'conv':
+        print("\nUsing Nodule Classifier\n")
         div = cfg['models'][arch][modality]['div']
         model = NoduleClassifier(input_dim=feature_dim, num_classes=num_classes, div=div)
     else:
+        print("\nUsing Monomodal Classifier\n")
         mlp_ratio = cfg_model[modality]['mlp_ratio']
         num_heads = cfg_model[modality]['num_heads']
         num_layers = cfg_model[modality]['num_layers']
@@ -345,6 +354,25 @@ def build_model(cfg, feature_dim,arch, modality, modality_a, modality_b, num_cla
                                             num_layers=num_layers)
     return model
 
+def add_mode(param,mode):
+    words = param.split(".")  
+    words[0] = words[0]+f"_{mode}"
+    new_name = ".".join(words)
+    return new_name
+
+def load_model_mono(cfg,mono_train,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b, froze_trans=False,num_classes=2):
+    model=build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,froze_trans,num_classes)
+    if mono_train:
+        ct_weight=torch.load(ct_path, map_location="cpu",weights_only=True)
+        pet_weight=torch.load(pet_path, map_location="cpu",weights_only=True)
+        params = {add_mode(k,"ct"):v for k, v in ct_weight.items() if k.startswith(('cls_token','transformer_encoder','norm'))}
+        params_pet = {add_mode(k,"pet"):v for k, v in pet_weight.items() if k.startswith(('cls_token','transformer_encoder','norm'))}
+        params.update(params_pet)
+        model.load_state_dict(params, strict=False)
+        print("\n\n Loaded Monomodal weights \n\n")
+    else:
+        print("\n\n Without pretrained monomodal weights \n\n")
+    return model
 
 def get_label_encoder(df):
     EGFR_names = list(df['label'].unique())
@@ -430,8 +458,14 @@ if __name__ == "__main__":
                         help="'focal' 'crossmodal'")
     parser.add_argument("-e", "--experiment", type=str, default='petct_online',
                         help="experiment name")
-    parser.add_argument("-t", "--threshold", type=int, default=0,
+    parser.add_argument("-t", "--threshold", type=float, default=0.5,
                         help="threshold for classification")
+    parser.add_argument("-pm", "--pretrain_mono", type=bool, default=False,
+                        help="using checkpoint from a monomodal training")
+    parser.add_argument("-ft", "--froze_trans", type=bool, default=False,
+                        help="train transformer")
+    parser.add_argument("-wm", "--weight_mono", type=str, default=None,
+                        help="weight of mono pretraining")
     args = parser.parse_args()
 
     arch = args.arch
@@ -443,6 +477,10 @@ if __name__ == "__main__":
     loss_func = args.loss
     experiment_name = args.experiment
     threshold=args.threshold
+    
+    pretrain_mono=args.pretrain_mono
+    froze_trans=args.froze_trans
+    weight_mono=args.weight_mono
 
     modality_a = 'pet'
     if 'chest' in modality:
@@ -453,8 +491,8 @@ if __name__ == "__main__":
     device = f'cuda:{gpu_id}'
 
             
-    df_metdata_path="../../Data/lung_radiomics_datasets_mod.csv"
-    hdf5_path = "../../Data/lung_radiomics_datasets.hdf5"
+    df_metdata_path="../../../Data/PET-CT/lung_radiomics_datasets_mod.csv"
+    hdf5_path = "../../../Data/PET-CT/lung_radiomics_datasets.hdf5"
     models_save_dir = os.path.join('..', 'models', experiment_name, f'{backbone}_{arch}_{arg_dataset}')
 
     cfg = load_conf()
@@ -476,7 +514,7 @@ if __name__ == "__main__":
 
     # use KFold to split patients stratified by label
     print("begin training!!\n")
-    pd_datas=pd.DataFrame(columns=["kfold","epoch","patient","class_real","class_predict"])
+    pd_datas=pd.DataFrame(columns=["kfold","epoch","patient","patient_slices","class_real","class_1_prob"])
     folds = list(cfg['kfold_patients'][modality_b][arg_dataset].keys())
     for kfold in tqdm(folds, desc='kfold', leave=False, position=0):
         save_dir = os.path.join(models_save_dir, modality, f'kfold_{kfold}')
@@ -494,7 +532,19 @@ if __name__ == "__main__":
         best_roc_auc_test=0
         # Create model instance
         feature_dim,model_backbone=load_model_backbone(backbone)
-        model = build_model(cfg,feature_dim, arch, modality, modality_a, modality_b, num_classes=2)
+
+        if pretrain_mono:
+            ct_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"ct",f"kfold_{kfold}","best_model_epoch.pth")
+            pet_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"pet",f"kfold_{kfold}","best_model_epoch.pth")
+
+        model = load_model_mono(cfg,pretrain_mono,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b,froze_trans=froze_trans)
+        
+        if froze_trans:
+            for param in model.transformer_encoder_ct.parameters():
+                param.requires_grad = False
+            for param in model.transformer_encoder_pet.parameters():
+                param.requires_grad = False
+            
         print(model)
         print(model_backbone)
         print(get_number_of_params(model))
@@ -571,38 +621,64 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 i = 0
                 iters_to_accumulate = min(virtual_batch_size, len(train_loader))
-                for images_batchs, masks_batchs,big_masks_batch,labels_batch, patient_id_batch,all_spatial_res in tqdm(train_loader, position=2, desc='train batch'):
+                for images_batchs, masks_batchs,big_masks_batch,labels_batch, patient_id_batch,all_spatial_res,_ in tqdm(train_loader, position=2, desc='train batch'):
                     
-                    features_pet, _ = generate_features(model=model_backbone,
-                                        img_3d=np.array(images_batchs[0][0]),
-                                        mask_3d=np.array(masks_batchs[0][0]),
-                                        bigger_mask=np.array(big_masks_batch[0][0]))
-
-                    features_ct, _ = generate_features(model=model_backbone,
-                                        img_3d=np.array(images_batchs[1][0]),
-                                        mask_3d=np.array(masks_batchs[1][0]),
-                                        bigger_mask=np.array(big_masks_batch[1][0]))
-                    pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
-                    pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
-                    ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=True)
-                    ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
-                
                     labels_batch = torch.squeeze(labels_batch).to(device)
                     if modality == 'petct' or modality == 'petchest':
+                                            
+                        features_pet, _ = generate_features(model=model_backbone,
+                                            img_3d=np.array(images_batchs[0][0]),
+                                            mask_3d=np.array(masks_batchs[0][0]),
+                                            bigger_mask=np.array(big_masks_batch[0][0]))
+    
+                        features_ct, _ = generate_features(model=model_backbone,
+                                            img_3d=np.array(images_batchs[1][0]),
+                                            mask_3d=np.array(masks_batchs[1][0]),
+                                            bigger_mask=np.array(big_masks_batch[1][0]))
+                        pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
+                        pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
+                        ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=True)
+                        ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
+                    
+                    
                         ct_batch = ct_batch.to(device).unsqueeze(0)
                         pet_batch = pet_batch.to(device).unsqueeze(0)
                         outputs = model(ct_batch, pet_batch)
                     elif modality == 'pet':
-                        pet_batch = pet_batch.to(device)
+                        features_pet, _ = generate_features(model=model_backbone,
+                                            img_3d=np.array(images_batchs[0][0]),
+                                            mask_3d=np.array(masks_batchs[0][0]),
+                                            bigger_mask=np.array(big_masks_batch[0][0]))
+    
+                        pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
+                        pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
+                
+                        
+                        pet_batch = pet_batch.to(device).unsqueeze(0)
                         outputs = model(pet_batch)
                     elif modality == 'ct' or modality == 'chest':
-                        ct_batch = ct_batch.to(device)
+                        features_ct, _ = generate_features(model=model_backbone,
+                                            img_3d=np.array(images_batchs[1][0]),
+                                            mask_3d=np.array(masks_batchs[1][0]),
+                                            bigger_mask=np.array(big_masks_batch[1][0]))
+                        
+                        ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=True)
+                        ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
+                    
+                        ct_batch = ct_batch.to(device).unsqueeze(0)
                         outputs = model(ct_batch)
                     if loss_func == 'crossmodal':
-                        loss = criterion(torch.squeeze(outputs[0]),
-                                         torch.squeeze(outputs[2]),
-                                         torch.squeeze(outputs[3]),
-                                         labels_batch) / iters_to_accumulate
+                            if modality == 'petct' or modality == 'petchest':
+                                loss = criterion(torch.squeeze(outputs[0]),
+                                             labels_batch,    
+                                             torch.squeeze(outputs[2]),
+                                             torch.squeeze(outputs[3]),
+                                             )/ iters_to_accumulate
+                                
+                            else:
+                                loss = criterion(torch.squeeze(outputs[0]),
+                                             labels_batch,
+                                             torch.squeeze(outputs[1]),)/ iters_to_accumulate
                     else:
                         loss = criterion(torch.squeeze(outputs[0]), labels_batch) / iters_to_accumulate
                     y_true, y_score = get_y_true_and_pred(y_true=labels_batch, y_pred=outputs[0], cpu=True)
@@ -621,63 +697,92 @@ if __name__ == "__main__":
                     i += 1
                 # test loop
                 model.eval()
-                epoch_data={"kfold":[],"epoch":[],"patient":[],"class_real":[],"class_predict":[]}
+                epoch_data={"kfold":[],"epoch":[],"patient":[],"patient_slices":[],"class_real":[],"class_1_prob":[]}
                 with torch.no_grad():
-                    for images_batchs, masks_batchs, big_masks_batch,labels_batch, patient_id_batch,all_spatial_res in tqdm(test_loader, position=2, desc='test batch'):
-                        features_pet, _ = generate_features(model=model_backbone,
+                    for images_batchs, masks_batchs, big_masks_batch,labels_batch, patient_id_batch,all_spatial_res,patient_id_rew in tqdm(test_loader, position=2, desc='test batch'):
+                        
+                        labels_batch = torch.squeeze(labels_batch).to(device)
+                        if modality == 'petct' or modality == 'petchest':
+                            features_pet, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[0][0]),
                                             mask_3d=np.array(masks_batchs[0][0]),
                                             bigger_mask=np.array(big_masks_batch[0][0]))
     
-                        features_ct, _ = generate_features(model=model_backbone,
-                                            img_3d=np.array(images_batchs[1][0]),
-                                            mask_3d=np.array(masks_batchs[1][0]),
-                                            bigger_mask=np.array(big_masks_batch[1][0]))
-
-
-                        pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=False)
-                        pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
-                        ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=False)
-                        ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
-                        
-                        labels_batch = torch.squeeze(labels_batch).to(device)
-                        if modality == 'petct' or modality == 'petchest':
+                            features_ct, _ = generate_features(model=model_backbone,
+                                                img_3d=np.array(images_batchs[1][0]),
+                                                mask_3d=np.array(masks_batchs[1][0]),
+                                                bigger_mask=np.array(big_masks_batch[1][0]))
+    
+    
+                            pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=False)
+                            pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
+                            ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=False)
+                            ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
+                            
                             ct_batch = ct_batch.to(device).unsqueeze(0)
                             pet_batch = pet_batch.to(device).unsqueeze(0)
                             outputs = model(ct_batch, pet_batch)
                         elif modality == 'pet':
-                            pet_batch = pet_batch.to(device)
+                            features_pet, _ = generate_features(model=model_backbone,
+                                            img_3d=np.array(images_batchs[0][0]),
+                                            mask_3d=np.array(masks_batchs[0][0]),
+                                            bigger_mask=np.array(big_masks_batch[0][0]))
+    
+                            pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=False)
+                            pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
+                            
+                            pet_batch = pet_batch.to(device).unsqueeze(0)
                             outputs = model(pet_batch)
                         elif modality == 'ct' or modality == 'chest':
-                            ct_batch = ct_batch.to(device)
+                            features_ct, _ = generate_features(model=model_backbone,
+                                                img_3d=np.array(images_batchs[1][0]),
+                                                mask_3d=np.array(masks_batchs[1][0]),
+                                                bigger_mask=np.array(big_masks_batch[1][0]))
+    
+    
+                            ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=False)
+                            ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
+
+                            ct_batch = ct_batch.to(device).unsqueeze(0)
                             outputs = model(ct_batch)
                         if loss_func == 'crossmodal':
-                            loss = criterion(torch.squeeze(outputs[0]),
+                            if modality == 'petct' or modality == 'petchest':
+                                loss = criterion(torch.squeeze(outputs[0]),
+                                             labels_batch,    
                                              torch.squeeze(outputs[2]),
                                              torch.squeeze(outputs[3]),
-                                             labels_batch)
+                                             )
+                                
+                            else:
+                                loss = criterion(torch.squeeze(outputs[0]),
+                                             labels_batch,
+                                             torch.squeeze(outputs[1]),)
+                        
                         else:
                             loss = criterion(torch.squeeze(outputs[0]), labels_batch)
+                            
                         y_true, y_score = get_y_true_and_pred(y_true=labels_batch, y_pred=outputs[0], cpu=True)
                         
+                        patient_ids_test.append(np.array(patient_id_batch))
                         epoch_data["kfold"].append(kfold)
                         epoch_data["epoch"].append(epoch)
                         epoch_data["patient"].append(patient_id_batch[0])
+                        epoch_data["patient_slices"].append(patient_id_rew[0])
                         epoch_data["class_real"].append(y_true[0])
-                        epoch_data["class_predict"].append(np.argmax(y_score[0]))
-                        
-                        patient_ids_test.append(np.array(patient_id_batch))
-
+                        epoch_data["class_1_prob"].append(y_score[0][1])
                         total_test_loss += loss.item()
-
-                scheduler.step()
-                pd_epoch=pd.DataFrame(epoch_data).groupby("patient").mean().reset_index()
+                        
+                pd_epoch=pd.DataFrame(epoch_data)
+                pd_epoch_patient=pd_epoch.groupby("patient").max().reset_index()
+                #print(np.array(pd_epoch["class_predict"]))
                 pd_datas=pd.concat([pd_datas,pd_epoch])
                 pd_datas.to_csv(os.path.join(models_save_dir, modality,'epoch_results.csv'), index=False) 
                 
-                y_true_test=np.where(np.array(pd_epoch["class_real"])>threshold,1,0)
-                y_score_test=np.where(np.array(pd_epoch["class_predict"])>threshold,1,0)
+                y_true_test=np.array(pd_epoch_patient["class_real"])
+                y_score_test=np.array(pd_epoch_patient["class_1_prob"])
+
                 
+                scheduler.step()
                 avg_train_loss = total_train_loss / len(train_loader)
                 avg_test_loss = total_test_loss / len(test_loader)
 
@@ -695,11 +800,11 @@ if __name__ == "__main__":
 
                 y_score_train = np.concatenate(y_score_train, axis=0)[:, 1]
                 y_true_train == np.concatenate(y_true_train, axis=0)
-                y_pred_train = (y_score_train >= 0.5)*1
-
+                y_pred_train = (y_score_train >= threshold)*1
+                
                 #y_score_test = np.concatenate(y_score_test, axis=0)[:, 1]
                 #y_true_test == np.concatenate(y_true_test, axis=0)
-                y_pred_test = y_score_test
+                y_pred_test = (y_score_test >= threshold)*1
 
                 # create a clasification report of each split
                 roc_auc_test = roc_auc_score(y_true_test, y_score_test)
