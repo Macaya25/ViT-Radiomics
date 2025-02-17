@@ -29,7 +29,7 @@ def load_json(json_path: str):
 
 
 if __name__ == "__main__":
-    folder = 'petct_online_rad_dino_thr0'
+    folder = 'petct_online'
 
     metrics_per_fold = []
     metrics_sumary = {}
@@ -73,6 +73,7 @@ if __name__ == "__main__":
                         else:
                             data['split'] = 'train'
                         json_metrics.append(data)
+
 
             # save the training loss and accuracy curves with an animation slider to select the Kfold
             df_metrics = [pd.DataFrame(split_metrics).reset_index(drop=False) for split_metrics in json_metrics]

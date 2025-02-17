@@ -54,6 +54,12 @@ def prepare_image(img, model_name='medsam'):
         img_tensor = resize(img, (224*3, 224*3))
         img_tensor = gray2rgb(img_tensor)
         img_tensor = (img_tensor - mu) / std
+    elif model_name is None:
+        # img = gray2rgb(img) if len(img.shape) == 2 else img  
+        img_tensor = resize(img, (224, 224))
+        img_tensor = torch.as_tensor(img_tensor, dtype=torch.float32).cuda()
+        return img_tensor
+
     img_tensor = img_tensor.transpose((2, 0, 1))
     img_tensor = np.expand_dims(img_tensor, axis=0)
     img_tensor = torch.as_tensor(img_tensor, dtype=torch.float32).cuda()
@@ -191,45 +197,58 @@ def get_dense_descriptor(model, img):
         features (np.array): slice feature maps with shape (N//patch_size, M//patch_size, feature_dim).
 
     """
-    img_tensor = prepare_image(img, model_name=model.model_name)
     
-    if model.model_name=='medsam':
-        with torch.no_grad():
+    if model:
+        img_tensor = prepare_image(img, model_name=model.model_name)
+
+        if model.model_name=='medsam':
+            with torch.no_grad():
+                features_tensor = model(img_tensor)
+                features = features_tensor.cpu().detach().numpy()
+                features = np.squeeze(features)
+                features = np.transpose(features, (1, 2, 0))
+
+        elif model.model_name in ['medsam_normvit','medsam_lora']:
             features_tensor = model(img_tensor)
             features = features_tensor.cpu().detach().numpy()
             features = np.squeeze(features)
             features = np.transpose(features, (1, 2, 0))
-
-    elif model.model_name in ['medsam_normvit','medsam_lora']:
-        features_tensor = model(img_tensor)
-        features = features_tensor.cpu().detach().numpy()
-        features = np.squeeze(features)
-        features = np.transpose(features, (1, 2, 0))
-        
-    elif model.model_name == 'dinov2': # Dino
-        with torch.no_grad():
-            features_dict = model.forward_features(img_tensor)
-            features_tensor = features_dict['x_norm_patchtokens']
-            features = features_tensor.cpu().detach().numpy()
-            del features_dict
-            features = np.squeeze(features)
-            featmap_size = int(np.sqrt(features.shape[0]))
-            features = features.reshape(featmap_size, featmap_size, features.shape[1])
             
-    elif model.model_name == 'rad_dino':
+        elif model.model_name == 'dinov2': # Dino
+            with torch.no_grad():
+                features_dict = model.forward_features(img_tensor)
+                features_tensor = features_dict['x_norm_patchtokens']
+                features = features_tensor.cpu().detach().numpy()
+                del features_dict
+                features = np.squeeze(features)
+                featmap_size = int(np.sqrt(features.shape[0]))
+                features = features.reshape(featmap_size, featmap_size, features.shape[1])
+                
+        elif model.model_name == 'rad_dino':
+            with torch.no_grad():
+                features_dict = model(img_tensor,return_dict=True)
+                features_tensor = features_dict["last_hidden_state"]
+                features = features_tensor.cpu().detach().numpy()
+                del features_dict
+                features = np.squeeze(features)[1:]
+                featmap_size = int(np.sqrt(features.shape[0]))
+                features = features.reshape(featmap_size, featmap_size, features.shape[1])
+        del features_tensor
+
+    else:
+        img_tensor = prepare_image(img, model_name=None)
         with torch.no_grad():
-            features_dict = model(img_tensor,return_dict=True)
-            features_tensor = features_dict["last_hidden_state"]
-            features = features_tensor.cpu().detach().numpy()
-            del features_dict
-            features = np.squeeze(features)[1:]
-            featmap_size = int(np.sqrt(features.shape[0]))
-            features = features.reshape(featmap_size, featmap_size, features.shape[1])
+            
+            features = img_tensor.cpu().detach().numpy()
+            features = resize(features, (features.shape[0] // 4, features.shape[1] // 4))
+
+            features = np.expand_dims(features, axis=-1)
+            features = np.repeat(features, 256, axis=-1)
+
+
 
     del img_tensor
-    del features_tensor
     torch.cuda.empty_cache()
-
     return features
 
 

@@ -392,7 +392,7 @@ def process(features,feature_dim,arch,spatial_res,use_augmentation):
             scale_noise = 1.0
             
         spatial_res = np.abs(spatial_res) * scale_noise
-
+        
         features = np.transpose(np.stack(features, axis=0), axes=(3, 0, 1, 2))  # (slice, h, w, feat_dim) -> (feat_dim, slice, h, w)
         if arch == 'transformer':
             h_orig, w_orig = features.shape[0:2]
@@ -440,6 +440,11 @@ def load_model_backbone(backbone):
         model_backbone=model_backbone.eval()
         for param in model_backbone.parameters():
             param.requires_grad = False
+    
+    elif backbone=='none':
+        feature_dim=256
+        model_backbone=None
+
     return feature_dim,model_backbone
 
 if __name__ == "__main__":
@@ -491,8 +496,8 @@ if __name__ == "__main__":
     device = f'cuda:{gpu_id}'
 
             
-    df_metdata_path="../../../Data/PET-CT/lung_radiomics_datasets_mod.csv"
-    hdf5_path = "../../../Data/PET-CT/lung_radiomics_datasets.hdf5"
+    df_metdata_path="../../Data/lung_radiomics_datasets_mod.csv"
+    hdf5_path = "../../Data/lung_radiomics_datasets.hdf5"
     models_save_dir = os.path.join('..', 'models', experiment_name, f'{backbone}_{arch}_{arg_dataset}')
 
     cfg = load_conf()
@@ -536,9 +541,10 @@ if __name__ == "__main__":
         if pretrain_mono:
             ct_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"ct",f"kfold_{kfold}","best_model_epoch.pth")
             pet_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"pet",f"kfold_{kfold}","best_model_epoch.pth")
+            model = load_model_mono(cfg,pretrain_mono,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b,froze_trans=froze_trans)
+        else:
+            model=build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,froze_trans,num_classes=2)
 
-        model = load_model_mono(cfg,pretrain_mono,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b,froze_trans=froze_trans)
-        
         if froze_trans:
             for param in model.transformer_encoder_ct.parameters():
                 param.requires_grad = False
@@ -549,7 +555,12 @@ if __name__ == "__main__":
         print(model_backbone)
         print(get_number_of_params(model))
         model = model.to(device)
-        model_backbone = model_backbone.to(device)
+
+        if backbone != "none":
+            model_backbone = model_backbone.to(device)
+        else:
+            model_backbone = None
+        
 
         if loss_func == 'crossmodal':
             print("crossmodal loss function!!")
@@ -561,8 +572,12 @@ if __name__ == "__main__":
             print("focal loss function!!")
             criterion = FocalLoss(alpha=torch.tensor([0.25, 0.75]).to(device), gamma=2.0)
 
-        img_enc_params = [p for p in model_backbone.parameters() if p.requires_grad]
-        img_encdec_params = list(img_enc_params) + list(model.parameters())
+        if model_backbone:
+            img_enc_params = [p for p in model_backbone.parameters() if p.requires_grad]
+            img_encdec_params = list(img_enc_params) + list(model.parameters())
+        else:
+            img_encdec_params = list(model.parameters())
+
         optimizer = torch.optim.AdamW(img_encdec_params, lr=learning_rate, weight_decay=0.01, amsgrad=False)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs*0.8, eta_min=0.0001)
 
