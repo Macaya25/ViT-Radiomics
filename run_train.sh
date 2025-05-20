@@ -1,7 +1,8 @@
 #!/bin/bash
 
 cd ./src/
-python ./train_models.py --arch "transformer" --dataset "stanford" --modality "petct" --backbone "none"
+python ./train_models.py --arch "transformer" --dataset "stanford" --modality "pet" 
+python ./train_models.py --arch "transformer" --dataset "stanford" --modality "petct"
 
 # python ./train_models.py --arch "conv" --dataset "stanford" --modality "pet" --gpu 1 --loss "focal"
 # python ./train_models.py --arch "conv" --dataset "stanford" --modality "ct" --gpu 1 --loss "focal"
