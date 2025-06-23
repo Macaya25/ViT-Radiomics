@@ -29,6 +29,7 @@ from datasets import PETCTDataset3D_onlineV1, PETCTDataset3D_onlineV2
 from tfds_dense_descriptor import get_voxels, flip_image, rotate_image, apply_window_ct,load_model,get_dense_descriptor
 from visualization_utils import extract_roi
 from all_medsams import medsam_normvit_neck, LoRA_sam
+import nrrd_module
 
 def positional_encoding_3d(x, y, z, D, scale=10000):
     x, y, z = np.asarray(x), np.asarray(y), np.asarray(z)
@@ -67,6 +68,8 @@ def generate_features(model, img_3d, mask_3d, bigger_mask):
     mask_list = []
     for slice_i in range(0, img_3d.shape[2]):
         mask = mask_3d[:, :, slice_i] > 0
+        if mask.sum() < 1:
+            continue
         img = img_3d[:, :, slice_i]
         features = get_dense_descriptor(model, img)
         crop_features = extract_roi(features, bigger_mask)
@@ -636,41 +639,91 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 i = 0
                 iters_to_accumulate = min(virtual_batch_size, len(train_loader))
+                temp_iter = 0
+
                 for images_batchs, masks_batchs,big_masks_batch,labels_batch, patient_id_batch,all_spatial_res,_ in tqdm(train_loader, position=2, desc='train batch'):
-                    
+                
                     labels_batch = torch.squeeze(labels_batch).to(device)
                     if modality == 'petct' or modality == 'petchest':
+
+                        
+                        roi_image, roi_mask = nrrd_module.get_roi_sphere(patient_id_batch[0])
                                             
                         features_pet, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[0][0]),
                                             mask_3d=np.array(masks_batchs[0][0]),
                                             bigger_mask=np.array(big_masks_batch[0][0]))
+
+                        desired_feature_shape_x, desired_feature_shape_y, _ = features_pet[-1].shape
+                        
+                        if roi_image is not None:
+                            for image_2d, mask_2d in zip(roi_image, roi_mask):
+                                if mask_2d.sum() < 1:
+                                    continue
+                                roi_single_features = get_dense_descriptor(model_backbone, image_2d)
+                                roi_single_features = extract_roi(roi_single_features, roi_mask)
+                                # print("Transforming: ", roi_single_features.shape)
+                                roi_single_features = nrrd_module.upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
+                                # print("Should be equal to: ", roi_single_features.shape)
+                                features_pet.append(roi_single_features)
+    
+                                # print("\nROI shape: ", roi_features[0].shape)
+                                # print("Length: ", len(roi_features))
+
     
                         features_ct, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[1][0]),
                                             mask_3d=np.array(masks_batchs[1][0]),
                                             bigger_mask=np.array(big_masks_batch[1][0]))
+
+                        
                         pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
                         pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
                         ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=True)
                         ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
                     
+                        
                     
                         ct_batch = ct_batch.to(device).unsqueeze(0)
                         pet_batch = pet_batch.to(device).unsqueeze(0)
                         outputs = model(ct_batch, pet_batch)
+
                     elif modality == 'pet':
+
+                        roi_image, roi_mask = nrrd_module.get_roi_sphere(patient_id_batch[0])
+
                         features_pet, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[0][0]),
                                             mask_3d=np.array(masks_batchs[0][0]),
                                             bigger_mask=np.array(big_masks_batch[0][0]))
+
+                        # print("\nCurrent Size: ", len(features_pet))
+                        desired_feature_shape_x, desired_feature_shape_y, _ = features_pet[-1].shape
+
+
+                        if roi_image is not None:
+                            for image_2d, mask_2d in zip(roi_image, roi_mask):
+                                if mask_2d.sum() < 1:
+                                    continue
+                                roi_single_features = get_dense_descriptor(model_backbone, image_2d)
+                                roi_single_features = extract_roi(roi_single_features, roi_mask)
+                                # print("Transforming: ", roi_single_features.shape)
+                                roi_single_features = nrrd_module.upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
+                                # print("Should be equal to: ", roi_single_features.shape)
+                                features_pet.append(roi_single_features)
     
-                        pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
+                                # print("\nROI shape: ", roi_features[0].shape)
+                                # print("Length: ", len(roi_features))
+                        # process(roi_features, feature_dim, arch, np.array(all_spatial_res[1][0]), use_augmentation=True)
+                        # print("\nSize after adding ROI: ", len(features_pet))
+                        pet_batch = process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
+                        
+                        
                         pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
-                
                         
                         pet_batch = pet_batch.to(device).unsqueeze(0)
                         outputs = model(pet_batch)
+
                     elif modality == 'ct' or modality == 'chest':
                         features_ct, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[1][0]),

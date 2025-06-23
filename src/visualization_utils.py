@@ -103,8 +103,8 @@ def crop_image(img, xmin, ymin, xmax, ymax):
 def extract_coords(mask, margin):
     indices = np.array(np.where(mask))
     ymin = np.min(indices[0, :]) - margin
-    xmin = np.min(indices[1, :]) + margin
-    ymax = np.max(indices[0, :]) - margin
+    xmin = np.min(indices[1, :]) - margin
+    ymax = np.max(indices[0, :]) + margin
     xmax = np.max(indices[1, :]) + margin
 
     h = max((ymax - ymin), margin)
