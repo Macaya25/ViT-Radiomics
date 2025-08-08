@@ -29,6 +29,8 @@ from datasets import PETCTDataset3D_onlineV1, PETCTDataset3D_onlineV2
 from tfds_dense_descriptor import get_voxels, flip_image, rotate_image, apply_window_ct,load_model,get_dense_descriptor
 from visualization_utils import extract_roi
 from all_medsams import medsam_normvit_neck, LoRA_sam
+import nrrd_module
+from load_frozen_model import load_frozen_transformers
 
 def positional_encoding_3d(x, y, z, D, scale=10000):
     x, y, z = np.asarray(x), np.asarray(y), np.asarray(z)
@@ -67,6 +69,8 @@ def generate_features(model, img_3d, mask_3d, bigger_mask):
     mask_list = []
     for slice_i in range(0, img_3d.shape[2]):
         mask = mask_3d[:, :, slice_i] > 0
+        if mask.sum() < 1:
+            continue
         img = img_3d[:, :, slice_i]
         features = get_dense_descriptor(model, img)
         crop_features = extract_roi(features, bigger_mask)
@@ -313,13 +317,12 @@ def find_divisor(slice_count, modality):
     return np.clip(desired_slices, 1, slice_count)
 
 
-
 def get_number_of_params(model):
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     param_count = sum([np.prod(p.size()) for p in model_parameters])
     return param_count
 
-def build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,mono_train ,num_classes=2):
+def build_model(cfg, feature_dim, arch, modality, modality_a, modality_b,mono_train ,num_classes=2):
     cfg_model = cfg['models'][arch]
     if modality == 'petct' or modality == 'petchest':
         print("\nUsing Bimodal Classifier\n")
@@ -392,7 +395,7 @@ def process(features,feature_dim,arch,spatial_res,use_augmentation):
             scale_noise = 1.0
             
         spatial_res = np.abs(spatial_res) * scale_noise
-
+        
         features = np.transpose(np.stack(features, axis=0), axes=(3, 0, 1, 2))  # (slice, h, w, feat_dim) -> (feat_dim, slice, h, w)
         if arch == 'transformer':
             h_orig, w_orig = features.shape[0:2]
@@ -440,6 +443,11 @@ def load_model_backbone(backbone):
         model_backbone=model_backbone.eval()
         for param in model_backbone.parameters():
             param.requires_grad = False
+    
+    elif backbone=='none':
+        feature_dim=256
+        model_backbone=None
+
     return feature_dim,model_backbone
 
 if __name__ == "__main__":
@@ -460,11 +468,15 @@ if __name__ == "__main__":
                         help="experiment name")
     parser.add_argument("-t", "--threshold", type=float, default=0.5,
                         help="threshold for classification")
+    parser.add_argument("-r", "--roi", type=str, default='n',
+                        help="Use roi")
     parser.add_argument("-pm", "--pretrain_mono", type=bool, default=False,
                         help="using checkpoint from a monomodal training")
     parser.add_argument("-ft", "--froze_trans", type=bool, default=False,
                         help="train transformer")
     parser.add_argument("-wm", "--weight_mono", type=str, default=None,
+                        help="weight of mono pretraining")
+    parser.add_argument("-wt", "--weight_transformers", type=bool, default=False,
                         help="weight of mono pretraining")
     args = parser.parse_args()
 
@@ -477,6 +489,8 @@ if __name__ == "__main__":
     loss_func = args.loss
     experiment_name = args.experiment
     threshold=args.threshold
+    roi_arg = args.roi
+    weight_transformers = args.weight_transformers
     
     pretrain_mono=args.pretrain_mono
     froze_trans=args.froze_trans
@@ -491,8 +505,8 @@ if __name__ == "__main__":
     device = f'cuda:{gpu_id}'
 
             
-    df_metdata_path="../../../Data/PET-CT/lung_radiomics_datasets_mod.csv"
-    hdf5_path = "../../../Data/PET-CT/lung_radiomics_datasets.hdf5"
+    df_metdata_path="../../Data/lung_radiomics_datasets_mod.csv"
+    hdf5_path = "../../Data/lung_radiomics_datasets.hdf5"
     models_save_dir = os.path.join('..', 'models', experiment_name, f'{backbone}_{arch}_{arg_dataset}')
 
     cfg = load_conf()
@@ -520,7 +534,6 @@ if __name__ == "__main__":
         save_dir = os.path.join(models_save_dir, modality, f'kfold_{kfold}')
         os.makedirs(save_dir, exist_ok=True)
 
-
         # filter dataframes based on the split patients
         cfg_model = cfg['models'][arch]
         learning_rate = cfg_model['learning_rate']
@@ -533,23 +546,44 @@ if __name__ == "__main__":
         # Create model instance
         feature_dim,model_backbone=load_model_backbone(backbone)
 
+        if model_backbone is None and roi_arg != "n":
+            roi_dim, roi_backbone = load_model_backbone(roi_arg)
+
         if pretrain_mono:
             ct_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"ct",f"kfold_{kfold}","best_model_epoch.pth")
             pet_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"pet",f"kfold_{kfold}","best_model_epoch.pth")
+            model = load_model_mono(cfg,pretrain_mono,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b,froze_trans=froze_trans)
+        elif weight_transformers:
+            if modality == "petct":
+                load_model_path = "../../vit-deep-radiomics-online/models/finished/roi_no_vit/petct/kfold_4/model_epoch_0000.pth"
+            elif modality == "pet":
+                load_model_path = "../../vit-deep-radiomics-online/models/finished/roi_no_vit/pet/kfold_1/best_model_epoch.pth"
+            model = load_frozen_transformers(cfg, load_model_path, feature_dim, arch, modality, modality_a, modality_b, num_classes=2)
+            froze_trans = True
+        else:
+            model = build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,froze_trans,num_classes=2)
 
-        model = load_model_mono(cfg,pretrain_mono,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b,froze_trans=froze_trans)
-        
         if froze_trans:
-            for param in model.transformer_encoder_ct.parameters():
-                param.requires_grad = False
-            for param in model.transformer_encoder_pet.parameters():
-                param.requires_grad = False
+            if modality == "petct":
+                for param in model.transformer_encoder_ct.parameters():
+                    param.requires_grad = False
+                for param in model.transformer_encoder_pet.parameters():
+                    param.requires_grad = False
+            elif modality == "pet":
+                for param in model.transformer_encoder.parameters():
+                    param.requires_grad = False
             
         print(model)
         print(model_backbone)
         print(get_number_of_params(model))
+        
         model = model.to(device)
-        model_backbone = model_backbone.to(device)
+
+        if backbone != "none":
+            model_backbone = model_backbone.to(device)
+        else:
+            model_backbone = None
+        
 
         if loss_func == 'crossmodal':
             print("crossmodal loss function!!")
@@ -561,8 +595,12 @@ if __name__ == "__main__":
             print("focal loss function!!")
             criterion = FocalLoss(alpha=torch.tensor([0.25, 0.75]).to(device), gamma=2.0)
 
-        img_enc_params = [p for p in model_backbone.parameters() if p.requires_grad]
-        img_encdec_params = list(img_enc_params) + list(model.parameters())
+        if model_backbone:
+            img_enc_params = [p for p in model_backbone.parameters() if p.requires_grad]
+            img_encdec_params = list(img_enc_params) + list(model.parameters())
+        else:
+            img_encdec_params = list(model.parameters())
+
         optimizer = torch.optim.AdamW(img_encdec_params, lr=learning_rate, weight_decay=0.01, amsgrad=False)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs*0.8, eta_min=0.0001)
 
@@ -621,41 +659,91 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 i = 0
                 iters_to_accumulate = min(virtual_batch_size, len(train_loader))
+                temp_iter = 0
+
                 for images_batchs, masks_batchs,big_masks_batch,labels_batch, patient_id_batch,all_spatial_res,_ in tqdm(train_loader, position=2, desc='train batch'):
-                    
+                
                     labels_batch = torch.squeeze(labels_batch).to(device)
                     if modality == 'petct' or modality == 'petchest':
+
+                        
+                        roi_image, roi_mask = nrrd_module.get_roi_sphere(patient_id_batch[0])
                                             
                         features_pet, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[0][0]),
                                             mask_3d=np.array(masks_batchs[0][0]),
                                             bigger_mask=np.array(big_masks_batch[0][0]))
+
+                        desired_feature_shape_x, desired_feature_shape_y, _ = features_pet[-1].shape
+                        
+                        if roi_image is not None:
+                            for image_2d, mask_2d in zip(roi_image, roi_mask):
+                                if mask_2d.sum() < 1:
+                                    continue
+                                roi_single_features = get_dense_descriptor(roi_backbone, image_2d)
+                                roi_single_features = extract_roi(roi_single_features, roi_mask)
+                                # print("Transforming: ", roi_single_features.shape)
+                                roi_single_features = nrrd_module.upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
+                                # print("Should be equal to: ", roi_single_features.shape)
+                                features_pet.append(roi_single_features)
+    
+                                # print("\nROI shape: ", roi_features[0].shape)
+                                # print("Length: ", len(roi_features))
+
     
                         features_ct, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[1][0]),
                                             mask_3d=np.array(masks_batchs[1][0]),
                                             bigger_mask=np.array(big_masks_batch[1][0]))
+
+                        
                         pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
                         pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
                         ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=True)
                         ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
                     
+                        
                     
                         ct_batch = ct_batch.to(device).unsqueeze(0)
                         pet_batch = pet_batch.to(device).unsqueeze(0)
                         outputs = model(ct_batch, pet_batch)
+
                     elif modality == 'pet':
+
+                        roi_image, roi_mask = nrrd_module.get_roi_sphere(patient_id_batch[0])
+
                         features_pet, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[0][0]),
                                             mask_3d=np.array(masks_batchs[0][0]),
                                             bigger_mask=np.array(big_masks_batch[0][0]))
+
+                        # print("\nCurrent Size: ", len(features_pet))
+                        desired_feature_shape_x, desired_feature_shape_y, _ = features_pet[-1].shape
+
+
+                        if roi_image is not None:
+                            for image_2d, mask_2d in zip(roi_image, roi_mask):
+                                if mask_2d.sum() < 1:
+                                    continue
+                                roi_single_features = get_dense_descriptor(roi_backbone, image_2d)
+                                roi_single_features = extract_roi(roi_single_features, roi_mask)
+                                # print("Transforming: ", roi_single_features.shape)
+                                roi_single_features = nrrd_module.upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
+                                # print("Should be equal to: ", roi_single_features.shape)
+                                features_pet.append(roi_single_features)
     
-                        pet_batch=process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
+                                # print("\nROI shape: ", roi_features[0].shape)
+                                # print("Length: ", len(roi_features))
+                        # process(roi_features, feature_dim, arch, np.array(all_spatial_res[1][0]), use_augmentation=True)
+                        # print("\nSize after adding ROI: ", len(features_pet))
+                        pet_batch = process(features_pet,feature_dim,arch,np.array(all_spatial_res[0][0]),use_augmentation=True)
+                        
+                        
                         pet_batch = torch.as_tensor(pet_batch, dtype=torch.float32)
-                
                         
                         pet_batch = pet_batch.to(device).unsqueeze(0)
                         outputs = model(pet_batch)
+
                     elif modality == 'ct' or modality == 'chest':
                         features_ct, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[1][0]),
