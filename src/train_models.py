@@ -30,6 +30,7 @@ from tfds_dense_descriptor import get_voxels, flip_image, rotate_image, apply_wi
 from visualization_utils import extract_roi
 from all_medsams import medsam_normvit_neck, LoRA_sam
 import nrrd_module
+from load_frozen_model import load_frozen_transformers
 
 def positional_encoding_3d(x, y, z, D, scale=10000):
     x, y, z = np.asarray(x), np.asarray(y), np.asarray(z)
@@ -316,13 +317,12 @@ def find_divisor(slice_count, modality):
     return np.clip(desired_slices, 1, slice_count)
 
 
-
 def get_number_of_params(model):
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     param_count = sum([np.prod(p.size()) for p in model_parameters])
     return param_count
 
-def build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,mono_train ,num_classes=2):
+def build_model(cfg, feature_dim, arch, modality, modality_a, modality_b,mono_train ,num_classes=2):
     cfg_model = cfg['models'][arch]
     if modality == 'petct' or modality == 'petchest':
         print("\nUsing Bimodal Classifier\n")
@@ -468,11 +468,15 @@ if __name__ == "__main__":
                         help="experiment name")
     parser.add_argument("-t", "--threshold", type=float, default=0.5,
                         help="threshold for classification")
+    parser.add_argument("-r", "--roi", type=str, default='n',
+                        help="Use roi")
     parser.add_argument("-pm", "--pretrain_mono", type=bool, default=False,
                         help="using checkpoint from a monomodal training")
     parser.add_argument("-ft", "--froze_trans", type=bool, default=False,
                         help="train transformer")
     parser.add_argument("-wm", "--weight_mono", type=str, default=None,
+                        help="weight of mono pretraining")
+    parser.add_argument("-wt", "--weight_transformers", type=bool, default=False,
                         help="weight of mono pretraining")
     args = parser.parse_args()
 
@@ -485,6 +489,8 @@ if __name__ == "__main__":
     loss_func = args.loss
     experiment_name = args.experiment
     threshold=args.threshold
+    roi_arg = args.roi
+    weight_transformers = args.weight_transformers
     
     pretrain_mono=args.pretrain_mono
     froze_trans=args.froze_trans
@@ -528,7 +534,6 @@ if __name__ == "__main__":
         save_dir = os.path.join(models_save_dir, modality, f'kfold_{kfold}')
         os.makedirs(save_dir, exist_ok=True)
 
-
         # filter dataframes based on the split patients
         cfg_model = cfg['models'][arch]
         learning_rate = cfg_model['learning_rate']
@@ -541,22 +546,37 @@ if __name__ == "__main__":
         # Create model instance
         feature_dim,model_backbone=load_model_backbone(backbone)
 
+        if model_backbone is None and roi_arg != "n":
+            roi_dim, roi_backbone = load_model_backbone(roi_arg)
+
         if pretrain_mono:
             ct_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"ct",f"kfold_{kfold}","best_model_epoch.pth")
             pet_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"pet",f"kfold_{kfold}","best_model_epoch.pth")
             model = load_model_mono(cfg,pretrain_mono,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b,froze_trans=froze_trans)
+        elif weight_transformers:
+            if modality == "petct":
+                load_model_path = "../../vit-deep-radiomics-online/models/finished/roi_no_vit/petct/kfold_4/model_epoch_0000.pth"
+            elif modality == "pet":
+                load_model_path = "../../vit-deep-radiomics-online/models/finished/roi_no_vit/pet/kfold_1/best_model_epoch.pth"
+            model = load_frozen_transformers(cfg, load_model_path, feature_dim, arch, modality, modality_a, modality_b, num_classes=2)
+            froze_trans = True
         else:
-            model=build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,froze_trans,num_classes=2)
+            model = build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,froze_trans,num_classes=2)
 
         if froze_trans:
-            for param in model.transformer_encoder_ct.parameters():
-                param.requires_grad = False
-            for param in model.transformer_encoder_pet.parameters():
-                param.requires_grad = False
+            if modality == "petct":
+                for param in model.transformer_encoder_ct.parameters():
+                    param.requires_grad = False
+                for param in model.transformer_encoder_pet.parameters():
+                    param.requires_grad = False
+            elif modality == "pet":
+                for param in model.transformer_encoder.parameters():
+                    param.requires_grad = False
             
         print(model)
         print(model_backbone)
         print(get_number_of_params(model))
+        
         model = model.to(device)
 
         if backbone != "none":
@@ -660,7 +680,7 @@ if __name__ == "__main__":
                             for image_2d, mask_2d in zip(roi_image, roi_mask):
                                 if mask_2d.sum() < 1:
                                     continue
-                                roi_single_features = get_dense_descriptor(model_backbone, image_2d)
+                                roi_single_features = get_dense_descriptor(roi_backbone, image_2d)
                                 roi_single_features = extract_roi(roi_single_features, roi_mask)
                                 # print("Transforming: ", roi_single_features.shape)
                                 roi_single_features = nrrd_module.upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
@@ -705,7 +725,7 @@ if __name__ == "__main__":
                             for image_2d, mask_2d in zip(roi_image, roi_mask):
                                 if mask_2d.sum() < 1:
                                     continue
-                                roi_single_features = get_dense_descriptor(model_backbone, image_2d)
+                                roi_single_features = get_dense_descriptor(roi_backbone, image_2d)
                                 roi_single_features = extract_roi(roi_single_features, roi_mask)
                                 # print("Transforming: ", roi_single_features.shape)
                                 roi_single_features = nrrd_module.upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
