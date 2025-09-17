@@ -27,6 +27,7 @@ from visualization_utils import (crop_image,
                                  hu_to_rgb_vectorized)
 
 from all_medsams import medsam_normvit_neck, LoRA_sam
+from image_tokenization import convolution_3_layers
 
 def prepare_image(img, model_name='medsam'):
     """ Resize image and convert to torch cuda tensor
@@ -240,12 +241,11 @@ def get_dense_descriptor(model, img):
         with torch.no_grad():
             
             features = img_tensor.cpu().detach().numpy()
-            features = resize(features, (features.shape[0] // 4, features.shape[1] // 4))
 
-            features = np.expand_dims(features, axis=-1)
-            features = np.repeat(features, 256, axis=-1)
-
-
+            features = convolution_3_layers(features)
+            
+            features = features.squeeze(0).permute(1, 2, 0)
+            features = features.numpy()
 
     del img_tensor
     torch.cuda.empty_cache()

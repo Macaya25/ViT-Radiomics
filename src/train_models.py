@@ -29,14 +29,14 @@ from datasets import PETCTDataset3D_onlineV1, PETCTDataset3D_onlineV2
 from tfds_dense_descriptor import get_voxels, flip_image, rotate_image, apply_window_ct,load_model,get_dense_descriptor
 from visualization_utils import extract_roi
 from all_medsams import medsam_normvit_neck, LoRA_sam
-import nrrd_module
+from nrrd_module import get_roi_sphere, upscale_cropped_roi_to_liver_cropped_size, DEFAULT_ROI_ARG
 from load_frozen_model import load_frozen_transformers
 
 def positional_encoding_3d(x, y, z, D, scale=10000):
     x, y, z = np.asarray(x), np.asarray(y), np.asarray(z)
     n_points = x.shape[0]
     encoding = np.zeros((n_points, D))
-
+    
     for i in range(D // 6):
         exponent = scale ** (6 * i / D)
         encoding[:, 2*i] = np.sin(x / exponent)
@@ -468,7 +468,7 @@ if __name__ == "__main__":
                         help="experiment name")
     parser.add_argument("-t", "--threshold", type=float, default=0.5,
                         help="threshold for classification")
-    parser.add_argument("-r", "--roi", type=str, default='n',
+    parser.add_argument("-r", "--roi", type=str, default=DEFAULT_ROI_ARG,
                         help="Use roi")
     parser.add_argument("-pm", "--pretrain_mono", type=bool, default=False,
                         help="using checkpoint from a monomodal training")
@@ -530,6 +530,13 @@ if __name__ == "__main__":
     print("begin training!!\n")
     pd_datas=pd.DataFrame(columns=["kfold","epoch","patient","patient_slices","class_real","class_1_prob"])
     folds = list(cfg['kfold_patients'][modality_b][arg_dataset].keys())
+
+    feature_dim, model_backbone = load_model_backbone(backbone)
+    if pretrain_mono:
+            ct_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"ct","kfold_0","best_model_epoch.pth")
+            pet_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"pet","kfold_0","best_model_epoch.pth")
+            model = load_model_mono(cfg,pretrain_mono,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b,froze_trans=froze_trans)
+
     for kfold in tqdm(folds, desc='kfold', leave=False, position=0):
         save_dir = os.path.join(models_save_dir, modality, f'kfold_{kfold}')
         os.makedirs(save_dir, exist_ok=True)
@@ -544,15 +551,14 @@ if __name__ == "__main__":
         num_epochs = cfg_model['num_epochs']
         best_roc_auc_test=0
         # Create model instance
-        feature_dim,model_backbone=load_model_backbone(backbone)
+        
 
-        if model_backbone is None and roi_arg != "n":
-            roi_dim, roi_backbone = load_model_backbone(roi_arg)
+        if model_backbone is None and roi_arg != DEFAULT_ROI_ARG:
+            roi_backbone_name = roi_arg
+            roi_dim, roi_backbone = load_model_backbone(roi_backbone_name)
 
-        if pretrain_mono:
-            ct_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"ct",f"kfold_{kfold}","best_model_epoch.pth")
-            pet_path = os.path.join(weight_mono, f'{backbone}_{arch}_{arg_dataset}',"pet",f"kfold_{kfold}","best_model_epoch.pth")
-            model = load_model_mono(cfg,pretrain_mono,ct_path,pet_path,feature_dim, arch, modality, modality_a, modality_b,froze_trans=froze_trans)
+            model = build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,froze_trans,num_classes=2)
+
         elif weight_transformers:
             if modality == "petct":
                 load_model_path = "../../vit-deep-radiomics-online/models/finished/roi_no_vit/petct/kfold_4/model_epoch_0000.pth"
@@ -562,6 +568,9 @@ if __name__ == "__main__":
             froze_trans = True
         else:
             model = build_model(cfg, feature_dim,arch, modality, modality_a, modality_b,froze_trans,num_classes=2)
+            
+        
+        
 
         if froze_trans:
             if modality == "petct":
@@ -665,30 +674,25 @@ if __name__ == "__main__":
                 
                     labels_batch = torch.squeeze(labels_batch).to(device)
                     if modality == 'petct' or modality == 'petchest':
-
-                        
-                        roi_image, roi_mask = nrrd_module.get_roi_sphere(patient_id_batch[0])
                                             
                         features_pet, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[0][0]),
                                             mask_3d=np.array(masks_batchs[0][0]),
                                             bigger_mask=np.array(big_masks_batch[0][0]))
 
-                        desired_feature_shape_x, desired_feature_shape_y, _ = features_pet[-1].shape
+                        if roi_arg != DEFAULT_ROI_ARG:
+                            roi_image, roi_mask = get_roi_sphere(patient_id_batch[0])
+                            desired_feature_shape_x, desired_feature_shape_y, _ = features_pet[-1].shape
                         
-                        if roi_image is not None:
-                            for image_2d, mask_2d in zip(roi_image, roi_mask):
-                                if mask_2d.sum() < 1:
-                                    continue
-                                roi_single_features = get_dense_descriptor(roi_backbone, image_2d)
-                                roi_single_features = extract_roi(roi_single_features, roi_mask)
-                                # print("Transforming: ", roi_single_features.shape)
-                                roi_single_features = nrrd_module.upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
-                                # print("Should be equal to: ", roi_single_features.shape)
-                                features_pet.append(roi_single_features)
-    
-                                # print("\nROI shape: ", roi_features[0].shape)
-                                # print("Length: ", len(roi_features))
+                            if roi_image is not None and model_backbone is not None and roi_arg != DEFAULT_ROI_ARG:
+                                for image_2d, mask_2d in zip(roi_image, roi_mask):
+                                    if mask_2d.sum() < 1:
+                                        continue
+                                    roi_single_features = get_dense_descriptor(roi_backbone, image_2d)
+                                    roi_single_features = extract_roi(roi_single_features, roi_mask)
+                                    roi_single_features = upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
+
+                                    features_pet.append(roi_single_features)
 
     
                         features_ct, _ = generate_features(model=model_backbone,
@@ -710,7 +714,7 @@ if __name__ == "__main__":
 
                     elif modality == 'pet':
 
-                        roi_image, roi_mask = nrrd_module.get_roi_sphere(patient_id_batch[0])
+                        roi_image, roi_mask = get_roi_sphere(patient_id_batch[0])
 
                         features_pet, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[0][0]),
@@ -721,14 +725,14 @@ if __name__ == "__main__":
                         desired_feature_shape_x, desired_feature_shape_y, _ = features_pet[-1].shape
 
 
-                        if roi_image is not None:
+                        if roi_image is not None and model_backbone is not None and roi_arg != DEFAULT_ROI_ARG:
                             for image_2d, mask_2d in zip(roi_image, roi_mask):
                                 if mask_2d.sum() < 1:
                                     continue
                                 roi_single_features = get_dense_descriptor(roi_backbone, image_2d)
                                 roi_single_features = extract_roi(roi_single_features, roi_mask)
                                 # print("Transforming: ", roi_single_features.shape)
-                                roi_single_features = nrrd_module.upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
+                                roi_single_features = upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
                                 # print("Should be equal to: ", roi_single_features.shape)
                                 features_pet.append(roi_single_features)
     
@@ -745,10 +749,24 @@ if __name__ == "__main__":
                         outputs = model(pet_batch)
 
                     elif modality == 'ct' or modality == 'chest':
+                        roi_image, roi_mask = get_roi_sphere(patient_id_batch[0])
+                        
                         features_ct, _ = generate_features(model=model_backbone,
                                             img_3d=np.array(images_batchs[1][0]),
                                             mask_3d=np.array(masks_batchs[1][0]),
                                             bigger_mask=np.array(big_masks_batch[1][0]))
+
+                        desired_feature_shape_x, desired_feature_shape_y, _ = features_ct[-1].shape
+                        if roi_image is not None and model_backbone is not None and roi_arg != DEFAULT_ROI_ARG:
+                            for image_2d, mask_2d in zip(roi_image, roi_mask):
+                                if mask_2d.sum() < 1:
+                                    continue
+                                roi_single_features = get_dense_descriptor(roi_backbone, image_2d)
+                                roi_single_features = extract_roi(roi_single_features, roi_mask)
+                                # print("Transforming: ", roi_single_features.shape)
+                                roi_single_features = upscale_cropped_roi_to_liver_cropped_size(roi_single_features, desired_feature_shape_x, desired_feature_shape_y)
+                                # print("Should be equal to: ", roi_single_features.shape)
+                                features_ct.append(roi_single_features)
                         
                         ct_batch=process(features_ct,feature_dim,arch,np.array(all_spatial_res[1][0]),use_augmentation=True)
                         ct_batch = torch.as_tensor(ct_batch, dtype=torch.float32)
